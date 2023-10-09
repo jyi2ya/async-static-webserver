@@ -625,7 +625,8 @@ const char *content_types[] = {
     ".ico", "image/vnd.microsoft.icon",
     ".ics", "text/calendar",
     ".jar", "application/java-archive",
-    ".jpeg, .jpg", "image/jpeg",
+    ".jpg", "image/jpeg",
+    ".jpeg", "image/jpeg",
     ".js", "text/javascript",
     ".json", "application/json",
     ".jsonld", "application/ld+json",
@@ -708,7 +709,7 @@ Promise *send_file_with_header_p_poll(Promise *self, Waker *waker) {
         postfix -= 1;
     }
     const char *content_type = "application/octet-stream";
-    for (int i = 0; i < sizeof(content_types); i += 2) {
+    for (int i = 0; i < sizeof(content_types) / sizeof(content_types[0]); i += 2) {
         if (strcmp(content_types[i], postfix) == 0) {
             content_type = content_types[i + 1];
             break;
