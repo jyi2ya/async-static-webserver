@@ -4,10 +4,12 @@
 #include <string.h>
 #include <assert.h>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -357,6 +359,7 @@ void *IOLoop_spawn_blocking(Promise *start) {
     type *_result = (type *)malloc(sizeof(type)); \
     *_result = result; \
     promise_make_ready(self, _result); \
+    return self; \
 } while (0)
 
 #define ASYNC_AWAIT(type, result_, promise_) do { \
@@ -406,6 +409,92 @@ Promise *read_p(int fd, char *buf, size_t count) {
     ctx->fd = fd;
     ctx->buf = buf;
     ctx->count = count;
+    return self;
+}
+
+typedef struct {
+    int _state;
+    Promise *_awaiting;
+    int fd;
+    char ch;
+    int nbytes;
+} GetcharPContext;
+
+CONTEXT_ALLOCATION_FN(getchar_p, GetcharPContext)
+
+Promise *getchar_p_poll(Promise *self, Waker *waker) {
+    ASYNC_BEGIN(GetcharPContext);
+    ASYNC_AWAIT(int, ctx->nbytes, read_p(ctx->fd, &ctx->ch, 1));
+    int ch = ctx->nbytes == 0 ? EOF : ctx->ch;
+    ASYNC_RETURN(int, ch);
+    ASYNC_END();
+}
+
+Promise *getchar_p(int fd) {
+    Promise *self = Promise_new(getchar_p_poll, getchar_p_create_context);
+    ASYNC_MAKE_CTX(GetcharPContext);
+    ctx->fd = fd;
+    return self;
+}
+
+typedef struct {
+    int _state;
+    Promise *_awaiting;
+    int fd;
+
+    int ch;
+    char *line;
+    size_t capacity;
+    size_t length;
+
+    bool got_cr;
+} ReadlinePContext;
+
+CONTEXT_ALLOCATION_FN(readline_p, ReadlinePContext)
+
+Promise *readline_p_poll(Promise *self, Waker *waker) {
+    ASYNC_BEGIN(ReadlinePContext);
+
+    for (;;) {
+        if (ctx->length == ctx->capacity) {
+            ctx->capacity = ctx->capacity * 2 + 4;
+            ctx->line = (char *)realloc(ctx->line, ctx->capacity);
+        }
+
+        ASYNC_AWAIT(int, ctx->ch, getchar_p(ctx->fd));
+
+        if (ctx->ch == EOF) {
+            break;
+        }
+
+        if (ctx->got_cr && ctx->ch == '\n') {
+            break;
+        }
+
+        if (ctx->ch == '\r') {
+            ctx->got_cr = true;
+        } else {
+            ctx->got_cr = false;
+        }
+
+        ctx->line[ctx->length++] = ctx->ch;
+    }
+
+    ctx->line[ctx->length++] = '\0';
+
+    ASYNC_RETURN(char *, ctx->line);
+    ASYNC_END();
+}
+
+Promise *readline_p(int fd) {
+    Promise *self = Promise_new(readline_p_poll, readline_p_create_context);
+    ASYNC_MAKE_CTX(ReadlinePContext);
+    ctx->fd = fd;
+
+    ctx->line = NULL;
+    ctx->capacity = 0;
+    ctx->length = 0;
+    ctx->got_cr = false;
     return self;
 }
 
@@ -469,6 +558,11 @@ Promise *write_all_p_poll(Promise *self, Waker *waker) {
 Promise *write_all_p(int fd, const char *buf, size_t count) {
     Promise *self = Promise_new(write_all_p_poll, write_all_p_create_context);
     ASYNC_MAKE_CTX(WriteAllPContext);
+
+    if (count == 0) {
+        count = strlen(buf);
+    }
+
     ctx->fd = fd;
     ctx->buf = buf;
     ctx->count = count;
@@ -502,7 +596,174 @@ Promise *accept_p(int fd, struct sockaddr *addr, socklen_t *len) {
     ctx->fd = fd;
     ctx->addr = addr;
     ctx->len = len;
+
     return self;
+}
+
+const char *content_types[] = {
+    ".aac", "audio/aac",
+    ".abw", "application/x-abiword",
+    ".arc", "application/x-freearc",
+    ".avif", "image/avif",
+    ".avi", "video/x-msvideo",
+    ".azw", "application/vnd.amazon.ebook",
+    ".bin", "application/octet-stream",
+    ".bmp", "image/bmp",
+    ".bz", "application/x-bzip",
+    ".bz2", "application/x-bzip2",
+    ".cda", "application/x-cdf",
+    ".csh", "application/x-csh",
+    ".css", "text/css",
+    ".csv", "text/csv",
+    ".doc", "application/msword",
+    ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".eot", "application/vnd.ms-fontobject",
+    ".epub", "application/epub+zip",
+    ".gz", "application/gzip",
+    ".gif", "image/gif",
+    ".html", "text/html",
+    ".ico", "image/vnd.microsoft.icon",
+    ".ics", "text/calendar",
+    ".jar", "application/java-archive",
+    ".jpeg, .jpg", "image/jpeg",
+    ".js", "text/javascript",
+    ".json", "application/json",
+    ".jsonld", "application/ld+json",
+    ".mid", "audio/midi, audio/x-midi",
+    ".mjs", "text/javascript",
+    ".mp3", "audio/mpeg",
+    ".mp4", "video/mp4",
+    ".mpeg", "video/mpeg",
+    ".mpkg", "application/vnd.apple.installer+xml",
+    ".odp", "application/vnd.oasis.opendocument.presentation",
+    ".ods", "application/vnd.oasis.opendocument.spreadsheet",
+    ".odt", "application/vnd.oasis.opendocument.text",
+    ".oga", "audio/ogg",
+    ".ogv", "video/ogg",
+    ".ogx", "application/ogg",
+    ".opus", "audio/opus",
+    ".otf", "font/otf",
+    ".png", "image/png",
+    ".pdf", "application/pdf",
+    ".php", "application/x-httpd-php",
+    ".ppt", "application/vnd.ms-powerpoint",
+    ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".rar", "application/vnd.rar",
+    ".rtf", "application/rtf",
+    ".sh", "application/x-sh",
+    ".svg", "image/svg+xml",
+    ".tar", "application/x-tar",
+    ".tiff", "image/tiff",
+    ".ts", "video/mp2t",
+    ".ttf", "font/ttf",
+    ".txt", "text/plain",
+    ".vsd", "application/vnd.visio",
+    ".wav", "audio/wav",
+    ".weba", "audio/webm",
+    ".webm", "video/webm",
+    ".webp", "image/webp",
+    ".woff", "font/woff",
+    ".woff2", "font/woff2",
+    ".xhtml", "application/xhtml+xml",
+    ".xls", "application/vnd.ms-excel",
+    ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xml", "application/xml",
+    ".xul", "application/vnd.mozilla.xul+xml",
+    ".zip", "application/zip",
+    ".3gp", "video/3gpp",
+    ".3g2", "video/3gpp2",
+    ".7z", "application/x-7z-compressed",
+};
+
+typedef struct {
+    int _state;
+    Promise *_awaiting;
+    int fd;
+    const char *path;
+    const char *header;
+    int file_fd;
+    char buf[4096];
+    int nbytes;
+    char *headers;
+    int total_bytes;
+} SendFileWithHeaderPContext;
+
+CONTEXT_ALLOCATION_FN(send_file_with_header_p, SendFileWithHeaderPContext)
+
+Promise *send_file_with_header_p_poll(Promise *self, Waker *waker) {
+    ASYNC_BEGIN(SendFileWithHeaderPContext);
+
+    struct stat sb;
+    if (stat(ctx->path, &sb) == -1) {
+        perror("stat: ");
+        ASYNC_RETURN(int, 1);
+    }
+    ctx->total_bytes = sb.st_size;
+
+    const char *postfix = ctx->path;
+    while (*postfix != '\0') {
+        postfix += 1;
+    }
+    while (*postfix != '.' && postfix != ctx->path) {
+        postfix -= 1;
+    }
+    const char *content_type = "application/octet-stream";
+    for (int i = 0; i < sizeof(content_types); i += 2) {
+        if (strcmp(content_types[i], postfix) == 0) {
+            content_type = content_types[i + 1];
+            break;
+        }
+    }
+    ctx->headers = (char *)malloc(
+            strlen(ctx->header) + strlen("\r\n")
+            + strlen("Content-Type: ") + strlen(content_type) + strlen("\r\n")
+            + strlen("Content-Length: XXXXXXXXXXXXXXXXXXX\r\n")
+            );
+    strcpy(ctx->headers, ctx->header);
+    strcat(ctx->headers, "\r\n");
+    strcat(ctx->headers, "Content-Type: ");
+    strcat(ctx->headers, content_type);
+    strcat(ctx->headers, "\r\n");
+    strcat(ctx->headers, "Content-Length: ");
+    sprintf(ctx->headers + strlen(ctx->headers), "%d\r\n\r\n", ctx->total_bytes);
+
+    ASYNC_AWAIT(int, ctx->nbytes, write_all_p(ctx->fd, ctx->headers, 0));
+
+    ctx->file_fd = open(ctx->path, O_RDWR | O_NONBLOCK);
+    if (ctx->file_fd == -1) {
+        perror("open: ");
+        ASYNC_RETURN(int, 2);
+    }
+
+    while (ctx->total_bytes > 0) {
+        ASYNC_AWAIT(int, ctx->nbytes, read_p(ctx->file_fd, ctx->buf, 4096));
+        if (ctx->nbytes == -1) {
+            perror("read: ");
+            ASYNC_RETURN(int, 3);
+        }
+        ctx->total_bytes -= ctx->nbytes;
+        if (ctx->nbytes > 0) {
+            ASYNC_AWAIT(int, ctx->nbytes, write_all_p(ctx->fd, ctx->buf, ctx->nbytes));
+        }
+    }
+
+    close(ctx->file_fd);
+
+    ASYNC_RETURN(int, 0);
+    ASYNC_END();
+}
+
+Promise *send_file_with_header_p(int fd, const char *path, const char *header) {
+    Promise *self = Promise_new(send_file_with_header_p_poll, send_file_with_header_p_create_context);
+    ASYNC_MAKE_CTX(SendFileWithHeaderPContext);
+    ctx->fd = fd;
+    ctx->path = path;
+    ctx->header = header;
+    return self;
+}
+
+int strprefixcmp(const char *prefix, const char *str) {
+    return strncmp(prefix, str, strlen(prefix));
 }
 
 typedef struct {
@@ -510,26 +771,92 @@ typedef struct {
     Promise *_awaiting;
 
     int fd;
+    int ln;
+    char *method;
+    char *file;
+    const char *basedir;
+    int file_fd;
     int ret;
 } WorkerPContext;
 
 CONTEXT_ALLOCATION_FN(worker_p, WorkerPContext)
 
 Promise *worker_p_poll(Promise *self, Waker *waker) {
-    static const char *msg = "hello hello?\n";
     ASYNC_BEGIN(WorkerPContext);
-    ASYNC_AWAIT(int, ctx->ret, write_all_p(ctx->fd, msg, strlen(msg)));
-    close(ctx->fd);
-    fprintf(stderr, "worker returns\n");
+
+    ASYNC_AWAIT(char *, ctx->method, readline_p(ctx->fd));
+
+    if (strprefixcmp("GET ", ctx->method) != 0) {
+        ASYNC_AWAIT(int, ctx->ret,
+                send_file_with_header_p(
+                    ctx->fd,
+                    "./assets/405.html",
+                    "HTTP/1.1 405 Method Not Allowed"
+                    )
+                );
+        close(ctx->fd);
+        ASYNC_RETURN(int, 1);
+    }
+
+    char *file = ctx->method + strlen("GET ");
+    for (int i = 0; file[i] != '\0'; ++i) {
+        if (file[i] == ' ') {
+            file[i] = '\0';
+            break;
+        }
+    }
+
+    ctx->file = (char *)malloc(strlen(ctx->basedir) + strlen(file) + 1);
+    strcpy(ctx->file, ctx->basedir);
+    strcat(ctx->file, file);
+    free(ctx->method);
+
+    ctx->file_fd = open(ctx->file, O_RDWR | O_NONBLOCK);
+
+    if (ctx->file_fd == -1) {
+        perror("open: ");
+        free(ctx->file);
+        ASYNC_AWAIT(int, ctx->ret,
+                send_file_with_header_p(
+                    ctx->fd,
+                    "./assets/403.html",
+                    "HTTP/1.1 403 Forbidden"
+                    )
+                );
+        close(ctx->fd);
+        ASYNC_RETURN(int, 2);
+    }
+
+    close(ctx->file_fd);
+
+    ASYNC_AWAIT(int, ctx->ret,
+            send_file_with_header_p(
+                ctx->fd,
+                ctx->file,
+                "HTTP/1.1 200 OK"
+                )
+            );
+    free(ctx->file);
+
+    shutdown(ctx->fd, SHUT_WR);
+    for (;;) {
+        ASYNC_AWAIT(int, ctx->ret, getchar_p(ctx->fd));
+        if (ctx->ret == EOF) {
+            break;
+        }
+    }
+    shutdown(ctx->fd, SHUT_RD);
+
     ASYNC_RETURN(int, 0);
     ASYNC_END();
 }
 
-Promise *worker_p(int fd) {
-    fprintf(stderr, "spawning worker\n");
+Promise *worker_p(int fd, const char *basedir) {
     Promise *self = Promise_new(worker_p_poll, worker_p_create_context);
     ASYNC_MAKE_CTX(WorkerPContext);
     ctx->fd = fd;
+    ctx->ln = 0;
+    ctx->basedir = basedir;
     return self;
 }
 
@@ -540,6 +867,7 @@ typedef struct {
     char *address;
     int port;
     int backlog;
+    const char *basedir;
 
     int listen_fd;
     int incoming_fd;
@@ -589,26 +917,27 @@ Promise *server_p_poll(Promise *self, Waker *waker) {
             fprintf(stderr, "accepting request from %s:%d\n", ip, port);
         }
 
-        ASYNC_SPAWN(worker_p(ctx->incoming_fd));
+        ASYNC_SPAWN(worker_p(ctx->incoming_fd, ctx->basedir));
     }
 
     ASYNC_RETURN(int, 0);
     ASYNC_END();
 }
 
-Promise *server_p(char *address, int port, int backlog) {
+Promise *server_p(char *address, int port, int backlog, const char *basedir) {
     Promise *self = Promise_new(server_p_poll, server_p_create_context);
 
     ASYNC_MAKE_CTX(ServerPContext);
     ctx->address = address;
     ctx->port = port;
     ctx->backlog = backlog;
+    ctx->basedir = basedir;
 
     ctx->len = sizeof(ctx->client_addr);
     return self;
 }
 
 int main(int argc, char *argv[]) {
-    IOLoop_spawn_blocking(server_p("127.0.0.1", 2333, 15));
+    IOLoop_spawn_blocking(server_p("0.0.0.0", 2333, 15, "./"));
     return 0;
 }
