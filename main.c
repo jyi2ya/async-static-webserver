@@ -4,7 +4,13 @@
 #include <string.h>
 #include <assert.h>
 
+#include <unistd.h>
+
 #include <sys/select.h>
+#include <sys/socket.h>
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 struct Waker;
 
@@ -186,6 +192,30 @@ int waker_get_runnables_by_yield(Waker *self, Promise **result) {
     return n;
 }
 
+int waker_wakeup_by_write(Waker *self, Promise *promise, int fd) {
+    for (int i = 0; i < MAX_PROMISES; ++i) {
+        if (self->is_write_slot_valid[i]) {
+            self->on_write[i].fd = fd;
+            self->on_write[i].promise = promise;
+            self->is_write_slot_valid[i] = false;
+            return 0;
+        }
+    }
+    assert(0 && "no more slots for write promises");
+}
+
+int waker_wakeup_by_read(Waker *self, Promise *promise, int fd) {
+    for (int i = 0; i < MAX_PROMISES; ++i) {
+        if (self->is_read_slot_valid[i]) {
+            self->on_read[i].fd = fd;
+            self->on_read[i].promise = promise;
+            self->is_read_slot_valid[i] = false;
+            return 0;
+        }
+    }
+    assert(0 && "no more slots for read promises");
+}
+
 int waker_wakeup_by_await(Waker *self, Promise *promise, Promise *await) {
     for (int i = 0; i < MAX_PROMISES; ++i) {
         if (self->is_await_slot_valid[i]) {
@@ -242,11 +272,30 @@ void *IOLoop_spawn_blocking(Promise *start) {
         static Promise *new_runnables[MAX_PROMISES];
         int n_runnables = 0;
 
-        for (int i = 0; i < self->n_runnables; ++i) {
-            Promise *current = self->runnables[i]->poll(self->runnables[i], self->waker);
-            if (promise_is_ready(current)) {
-                n_runnables += waker_get_runnables_by_await(self->waker, current, new_runnables + n_runnables);
+        while (!promise_is_ready(start)) {
+            n_runnables = 0;
+
+            for (int i = 0; i < self->n_runnables; ++i) {
+                Promise *current = self->runnables[i]->poll(self->runnables[i], self->waker);
+                if (promise_is_ready(current)) {
+                    int waiting = waker_get_runnables_by_await(self->waker, current, new_runnables + n_runnables);
+                    if (current != start && waiting == 0) {
+                        free(current->ready.result);
+                        Promise_drop(current);
+                    } else {
+                        n_runnables += waiting;
+                    }
+                }
             }
+
+            n_runnables += waker_get_runnables_by_yield(self->waker, new_runnables + n_runnables);
+
+            if (n_runnables == 0) {
+                break;
+            }
+
+            self->n_runnables = n_runnables;
+            memcpy(self->runnables, new_runnables, sizeof(Promise *) * n_runnables);
         }
 
         fd_set readfds, writefds;
@@ -270,8 +319,6 @@ void *IOLoop_spawn_blocking(Promise *start) {
             }
         }
 
-        n_runnables += waker_get_runnables_by_yield(self->waker, new_runnables + n_runnables);
-
         self->n_runnables = n_runnables;
         memcpy(self->runnables, new_runnables, sizeof(Promise *) * n_runnables);
     }
@@ -292,22 +339,35 @@ void *IOLoop_spawn_blocking(Promise *start) {
     switch (ctx->_state) { \
         case 0:
 
-#define ASYNC_YIELD() do { \
-    waker_wakeup_by_yield(waker, self); \
+#define ASYNC_WAIT() do { \
     ctx->_state = __LINE__; return self; case __LINE__: \
     ; \
-} while (0) \
-
-#define ASYNC_RETURN(result) do { \
-        promise_make_ready(self, result); \
 } while (0)
 
-#define ASYNC_AWAIT(result_, promise_) do { \
+#define ASYNC_SPAWN(promise) do { \
+    waker_wakeup_by_yield(waker, promise); \
+} while (0) \
+
+#define ASYNC_YIELD() do { \
+    waker_wakeup_by_yield(waker, self); \
+    ASYNC_WAIT(); \
+} while (0) \
+
+#define ASYNC_RETURN(type, result) do { \
+    type *_result = (type *)malloc(sizeof(type)); \
+    *_result = result; \
+    promise_make_ready(self, _result); \
+} while (0)
+
+#define ASYNC_AWAIT(type, result_, promise_) do { \
     ctx->_awaiting = (promise_); \
     waker_wakeup_by_await(waker, self, ctx->_awaiting); \
     waker_wakeup_by_yield(waker, ctx->_awaiting); \
-    ctx->_state = __LINE__; return self; case __LINE__: \
-    result_ = ctx->_awaiting->ready.result; \
+    ASYNC_WAIT(); \
+    if (ctx->_awaiting->ready.result != NULL) { \
+        result_ = *(type *)ctx->_awaiting->ready.result; \
+        free(ctx->_awaiting->ready.result); \
+    } \
     Promise_drop(ctx->_awaiting); \
 } while (0)
 
@@ -333,27 +393,10 @@ typedef struct {
 CONTEXT_ALLOCATION_FN(read_p, ReadPContext)
 
 Promise *read_p_poll(Promise *self, Waker *waker) {
-    printf("entering! reading\n");
-
     ASYNC_BEGIN(ReadPContext);
-
-    printf("step 1 %d\n", ctx->fd);
-
-    ASYNC_YIELD();
-
-    printf("step 2 %p\n", ctx->buf);
-
-    ASYNC_YIELD();
-
-    printf("step 3 %ld\n", ctx->count);
-
-    ASYNC_YIELD();
-
-    int *result = (int *)malloc(sizeof(int));
-    *result = 114514;
-
-    ASYNC_RETURN(result);
-
+    waker_wakeup_by_read(waker, self, ctx->fd);
+    ASYNC_WAIT();
+    ASYNC_RETURN(int, read(ctx->fd, ctx->buf, ctx->count));
     ASYNC_END();
 }
 
@@ -370,41 +413,21 @@ typedef struct {
     int _state;
     Promise *_awaiting;
     int fd;
-    char *buf;
+    const char *buf;
     size_t count;
 } WritePContext;
 
 CONTEXT_ALLOCATION_FN(write_p, WritePContext)
 
 Promise *write_p_poll(Promise *self, Waker *waker) {
-    printf("entering! writing\n");
-
     ASYNC_BEGIN(WritePContext);
-
-    printf("step 1 %d\n", ctx->fd);
-
-    int *read_result;
-    ASYNC_AWAIT(read_result, read_p(4, (char *)0x55, 666));;
-    printf("read result is %d\n", *read_result);
-    free(read_result);
-
-    printf("step 2 %p\n", ctx->buf);
-
-    ASYNC_YIELD();
-
-    printf("step 3 %ld\n", ctx->count);
-
-    ASYNC_YIELD();
-
-    int *result = (int *)malloc(sizeof(int));
-    *result = 1919810;
-
-    ASYNC_RETURN(result);
-
+    waker_wakeup_by_write(waker, self, ctx->fd);
+    ASYNC_WAIT();
+    ASYNC_RETURN(int, write(ctx->fd, ctx->buf, ctx->count));
     ASYNC_END();
 }
 
-Promise *write_p(int fd, char *buf, size_t count) {
+Promise *write_p(int fd, const char *buf, size_t count) {
     Promise *self = Promise_new(write_p_poll, write_p_create_context);
     ASYNC_MAKE_CTX(WritePContext);
     ctx->fd = fd;
@@ -413,9 +436,179 @@ Promise *write_p(int fd, char *buf, size_t count) {
     return self;
 }
 
+typedef struct {
+    int _state;
+    Promise *_awaiting;
+    int fd;
+    const char *buf;
+    size_t count;
+
+    const char *pos;
+    int nbytes;
+} WriteAllPContext;
+
+CONTEXT_ALLOCATION_FN(write_all_p, WriteAllPContext)
+
+Promise *write_all_p_poll(Promise *self, Waker *waker) {
+    ASYNC_BEGIN(WriteAllPContext);
+
+    while (ctx->count > 0) {
+        ASYNC_AWAIT(int, ctx->nbytes, write_p(ctx->fd, ctx->buf, ctx->count));
+        if (ctx->nbytes < 0) {
+            perror("write_all: ");
+            ASYNC_RETURN(int, 1);
+        }
+        ctx->pos += ctx->nbytes;
+        ctx->count -= ctx->nbytes;
+    }
+
+    ASYNC_RETURN(int, 0);
+    ASYNC_END();
+}
+
+Promise *write_all_p(int fd, const char *buf, size_t count) {
+    Promise *self = Promise_new(write_all_p_poll, write_all_p_create_context);
+    ASYNC_MAKE_CTX(WriteAllPContext);
+    ctx->fd = fd;
+    ctx->buf = buf;
+    ctx->count = count;
+
+    ctx->pos = ctx->buf;
+    return self;
+}
+
+typedef struct {
+    int _state;
+    Promise *_awaiting;
+
+    int fd;
+    struct sockaddr *addr;
+    socklen_t *len;
+} AcceptPContext;
+
+CONTEXT_ALLOCATION_FN(accept_p, AcceptPContext)
+
+Promise *accept_p_poll(Promise *self, Waker *waker) {
+    ASYNC_BEGIN(AcceptPContext);
+    waker_wakeup_by_read(waker, self, ctx->fd);
+    ASYNC_WAIT();
+    ASYNC_RETURN(int, accept(ctx->fd, ctx->addr, ctx->len));
+    ASYNC_END();
+}
+
+Promise *accept_p(int fd, struct sockaddr *addr, socklen_t *len) {
+    Promise *self = Promise_new(accept_p_poll, accept_p_create_context);
+    ASYNC_MAKE_CTX(AcceptPContext);
+    ctx->fd = fd;
+    ctx->addr = addr;
+    ctx->len = len;
+    return self;
+}
+
+typedef struct {
+    int _state;
+    Promise *_awaiting;
+
+    int fd;
+    int ret;
+} WorkerPContext;
+
+CONTEXT_ALLOCATION_FN(worker_p, WorkerPContext)
+
+Promise *worker_p_poll(Promise *self, Waker *waker) {
+    static const char *msg = "hello hello?\n";
+    ASYNC_BEGIN(WorkerPContext);
+    ASYNC_AWAIT(int, ctx->ret, write_all_p(ctx->fd, msg, strlen(msg)));
+    close(ctx->fd);
+    fprintf(stderr, "worker returns\n");
+    ASYNC_RETURN(int, 0);
+    ASYNC_END();
+}
+
+Promise *worker_p(int fd) {
+    fprintf(stderr, "spawning worker\n");
+    Promise *self = Promise_new(worker_p_poll, worker_p_create_context);
+    ASYNC_MAKE_CTX(WorkerPContext);
+    ctx->fd = fd;
+    return self;
+}
+
+typedef struct {
+    int _state;
+    Promise *_awaiting;
+
+    char *address;
+    int port;
+    int backlog;
+
+    int listen_fd;
+    int incoming_fd;
+    struct sockaddr_storage client_addr;
+    socklen_t len;
+} ServerPContext;
+
+CONTEXT_ALLOCATION_FN(server_p, ServerPContext)
+
+Promise *server_p_poll(Promise *self, Waker *waker) {
+    ASYNC_BEGIN(ServerPContext);
+
+    ctx->listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (ctx->listen_fd == -1) {
+        perror("socket: ");
+        assert(0);
+    }
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(ctx->port);
+    addr.sin_addr.s_addr = inet_addr(ctx->address);
+
+    if (bind(ctx->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        perror("bind: ");
+        assert(0);
+    }
+
+    if (listen(ctx->listen_fd, ctx->backlog) == -1) {
+        perror("listen: ");
+        assert(0);
+    }
+
+    for (;;) {
+        ASYNC_AWAIT(int, ctx->incoming_fd, accept_p(ctx->listen_fd, (struct sockaddr *)&ctx->client_addr, &ctx->len));
+
+        if (ctx->client_addr.ss_family != AF_INET) {
+            fprintf(stderr, "currently we support ipv4 protocol only\n");
+            fprintf(stderr, "required family is %u\n", ctx->client_addr.ss_family);
+            fprintf(stderr, "ipv4 is %u, ipv6 is %u, uds is %u\n", AF_INET, AF_INET6, AF_UNIX);
+        } else {
+            char ip[INET_ADDRSTRLEN];
+            struct sockaddr_in *s = (struct sockaddr_in *)&ctx->client_addr;
+            int port = ntohs(s->sin_port);
+            inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
+
+            fprintf(stderr, "accepting request from %s:%d\n", ip, port);
+        }
+
+        ASYNC_SPAWN(worker_p(ctx->incoming_fd));
+    }
+
+    ASYNC_RETURN(int, 0);
+    ASYNC_END();
+}
+
+Promise *server_p(char *address, int port, int backlog) {
+    Promise *self = Promise_new(server_p_poll, server_p_create_context);
+
+    ASYNC_MAKE_CTX(ServerPContext);
+    ctx->address = address;
+    ctx->port = port;
+    ctx->backlog = backlog;
+
+    ctx->len = sizeof(ctx->client_addr);
+    return self;
+}
+
 int main(int argc, char *argv[]) {
-    int *result = (int *)IOLoop_spawn_blocking(write_p(1, (char *)0x22, 333));
-    printf("result is %d\n", *result);
-    free(result);
+    IOLoop_spawn_blocking(server_p("127.0.0.1", 2333, 15));
     return 0;
 }
