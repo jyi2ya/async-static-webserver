@@ -41,6 +41,10 @@ Promise* Promise_new(struct Promise *(*poll)(struct Promise *self, struct Waker 
     return promise;
 }
 
+void Promise_drop(Promise *self) {
+    free(self);
+}
+
 bool promise_is_ready(Promise *self) {
     return self->tag == PromiseTagReady;
 }
@@ -182,6 +186,18 @@ int waker_get_runnables_by_yield(Waker *self, Promise **result) {
     return n;
 }
 
+int waker_wakeup_by_await(Waker *self, Promise *promise, Promise *await) {
+    for (int i = 0; i < MAX_PROMISES; ++i) {
+        if (self->is_await_slot_valid[i]) {
+            self->await[i].await = await;
+            self->await[i].promise = promise;
+            self->is_await_slot_valid[i] = false;
+            return 0;
+        }
+    }
+    assert(0 && "no more slots for await promises");
+}
+
 int waker_wakeup_by_yield(Waker *self, Promise *promise) {
     for (int i = 0; i < MAX_PROMISES; ++i) {
         if (self->is_yield_slot_valid[i]) {
@@ -261,7 +277,9 @@ void *IOLoop_spawn_blocking(Promise *start) {
     }
 
     IOLoop_drop(self);
-    return start->ready.result;
+    void *result = start->ready.result;
+    Promise_drop(start);
+    return result;
 }
 
 #define ASYNC_MAKE_CTX(context_type) \
@@ -274,31 +292,48 @@ void *IOLoop_spawn_blocking(Promise *start) {
     switch (ctx->_state) { \
         case 0:
 
-#define ASYNC_YIELD() \
-        ctx->_state = __LINE__; waker_wakeup_by_yield(waker, self); return self; case __LINE__:
+#define ASYNC_YIELD() do { \
+    waker_wakeup_by_yield(waker, self); \
+    ctx->_state = __LINE__; return self; case __LINE__: \
+    ; \
+} while (0) \
 
-#define ASYNC_RETURN(result) \
+#define ASYNC_RETURN(result) do { \
         promise_make_ready(self, result); \
+} while (0)
+
+#define ASYNC_AWAIT(result_, promise_) do { \
+    ctx->_awaiting = (promise_); \
+    waker_wakeup_by_await(waker, self, ctx->_awaiting); \
+    waker_wakeup_by_yield(waker, ctx->_awaiting); \
+    ctx->_state = __LINE__; return self; case __LINE__: \
+    result_ = ctx->_awaiting->ready.result; \
+    Promise_drop(ctx->_awaiting); \
+} while (0)
 
 #define ASYNC_END() \
     } \
     return self;
 
+#define CONTEXT_ALLOCATION_FN(fn_prefix, context_type) \
+    void * fn_prefix ## _create_context(void) { \
+        context_type *ctx = (context_type *)malloc(sizeof(context_type)); \
+        ctx->_state = 0; \
+        return (void *)ctx; \
+    }
+
 typedef struct {
     int _state;
+    Promise *_awaiting;
     int fd;
     char *buf;
     size_t count;
 } ReadPContext;
 
-void *read_p_create_context(void) {
-    ReadPContext *ctx = (ReadPContext *)malloc(sizeof(ReadPContext));
-    ctx->_state = 0;
-    return (void *)ctx;
-}
+CONTEXT_ALLOCATION_FN(read_p, ReadPContext)
 
 Promise *read_p_poll(Promise *self, Waker *waker) {
-    printf("entering!\n");
+    printf("entering! reading\n");
 
     ASYNC_BEGIN(ReadPContext);
 
@@ -314,7 +349,10 @@ Promise *read_p_poll(Promise *self, Waker *waker) {
 
     ASYNC_YIELD();
 
-    ASYNC_RETURN(NULL);
+    int *result = (int *)malloc(sizeof(int));
+    *result = 114514;
+
+    ASYNC_RETURN(result);
 
     ASYNC_END();
 }
@@ -328,7 +366,56 @@ Promise *read_p(int fd, char *buf, size_t count) {
     return self;
 }
 
+typedef struct {
+    int _state;
+    Promise *_awaiting;
+    int fd;
+    char *buf;
+    size_t count;
+} WritePContext;
+
+CONTEXT_ALLOCATION_FN(write_p, WritePContext)
+
+Promise *write_p_poll(Promise *self, Waker *waker) {
+    printf("entering! writing\n");
+
+    ASYNC_BEGIN(WritePContext);
+
+    printf("step 1 %d\n", ctx->fd);
+
+    int *read_result;
+    ASYNC_AWAIT(read_result, read_p(4, (char *)0x55, 666));;
+    printf("read result is %d\n", *read_result);
+    free(read_result);
+
+    printf("step 2 %p\n", ctx->buf);
+
+    ASYNC_YIELD();
+
+    printf("step 3 %ld\n", ctx->count);
+
+    ASYNC_YIELD();
+
+    int *result = (int *)malloc(sizeof(int));
+    *result = 1919810;
+
+    ASYNC_RETURN(result);
+
+    ASYNC_END();
+}
+
+Promise *write_p(int fd, char *buf, size_t count) {
+    Promise *self = Promise_new(write_p_poll, write_p_create_context);
+    ASYNC_MAKE_CTX(WritePContext);
+    ctx->fd = fd;
+    ctx->buf = buf;
+    ctx->count = count;
+    return self;
+}
+
 int main(int argc, char *argv[]) {
-    IOLoop_spawn_blocking(read_p(1, (char *)0x22, 333));
+    int *result = (int *)IOLoop_spawn_blocking(write_p(1, (char *)0x22, 333));
+    printf("result is %d\n", *result);
+    free(result);
     return 0;
 }
