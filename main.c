@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -694,12 +695,15 @@ CONTEXT_ALLOCATION_FN(send_file_with_header_p, SendFileWithHeaderPContext)
 Promise *send_file_with_header_p_poll(Promise *self, Waker *waker) {
     ASYNC_BEGIN(SendFileWithHeaderPContext);
 
+    fprintf(stderr, "response header: %s\n", ctx->header);
+
     struct stat sb;
     if (stat(ctx->path, &sb) == -1) {
         perror("stat: ");
         ASYNC_RETURN(int, 1);
     }
     ctx->total_bytes = sb.st_size;
+
 
     const char *postfix = ctx->path;
     while (*postfix != '\0') {
@@ -788,6 +792,8 @@ Promise *worker_p_poll(Promise *self, Waker *waker) {
 
     ASYNC_AWAIT(char *, ctx->method, readline_p(ctx->fd));
 
+    fprintf(stderr, "request header: %s\n", ctx->method);
+
     if (strprefixcmp("GET ", ctx->method) != 0) {
         ASYNC_AWAIT(int, ctx->ret,
                 send_file_with_header_p(
@@ -817,29 +823,44 @@ Promise *worker_p_poll(Promise *self, Waker *waker) {
 
     if (ctx->file_fd == -1) {
         perror("open: ");
-        free(ctx->file);
+        if (errno == EACCES) {
+            ASYNC_AWAIT(int, ctx->ret,
+                    send_file_with_header_p(
+                        ctx->fd,
+                        "./assets/403.html",
+                        "HTTP/1.1 403 Forbidden"
+                        )
+                    );
+        } else if (errno == ENOENT) {
+            ASYNC_AWAIT(int, ctx->ret,
+                    send_file_with_header_p(
+                        ctx->fd,
+                        "./assets/404.html",
+                        "HTTP/1.1 404 Not Found"
+                        )
+                    );
+        } else {
+            ASYNC_AWAIT(int, ctx->ret,
+                    send_file_with_header_p(
+                        ctx->fd,
+                        "./assets/500.html",
+                        "HTTP/1.1 500 Internal Server Error"
+                        )
+                    );
+        }
+    } else {
+        close(ctx->file_fd);
+
         ASYNC_AWAIT(int, ctx->ret,
                 send_file_with_header_p(
                     ctx->fd,
-                    "./assets/403.html",
-                    "HTTP/1.1 403 Forbidden"
+                    ctx->file,
+                    "HTTP/1.1 200 OK"
                     )
                 );
-        close(ctx->fd);
-        ASYNC_RETURN(int, 2);
     }
 
-    close(ctx->file_fd);
-
-    ASYNC_AWAIT(int, ctx->ret,
-            send_file_with_header_p(
-                ctx->fd,
-                ctx->file,
-                "HTTP/1.1 200 OK"
-                )
-            );
     free(ctx->file);
-
     shutdown(ctx->fd, SHUT_WR);
     for (;;) {
         ASYNC_AWAIT(int, ctx->ret, getchar_p(ctx->fd));
