@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+// {{{ Promise
 struct Waker;
 
 typedef enum {
@@ -69,6 +70,9 @@ Promise* promise_make_ready(Promise *self, void *result) {
     return self;
 }
 
+// }}}
+
+// {{{ Waker
 typedef struct {
     int fd;
     Promise *promise;
@@ -242,6 +246,10 @@ int waker_wakeup_by_yield(Waker *self, Promise *promise) {
     assert(0 && "no more slots for yield promises");
 }
 
+// }}}
+
+// {{{ IOLoop
+
 // FIXME: rewrite ioloop
 typedef struct {
     Waker *waker;
@@ -332,6 +340,9 @@ void *IOLoop_block_on(Promise *start) {
     return result;
 }
 
+// }}}
+
+// {{{ ASYNC helper macros
 #define ASYNC_MAKE_CTX(context_type) \
     context_type *ctx = (context_type *)(self->pending.context)
 
@@ -386,6 +397,9 @@ void *IOLoop_block_on(Promise *start) {
         return (void *)ctx; \
     }
 
+// }}}
+
+// {{{ Syscall wrappers
 typedef struct {
     int _state;
     Promise *_awaiting;
@@ -601,6 +615,9 @@ Promise *accept_p(int fd, struct sockaddr *addr, socklen_t *len) {
     return self;
 }
 
+// }}}
+
+// {{{ Web server
 const char *content_types[] = {
     ".aac", "audio/aac",
     ".abw", "application/x-abiword",
@@ -966,6 +983,9 @@ Promise *server_p(char *address, int port, int backlog, const char *basedir) {
     return self;
 }
 
+// }}}
+
+// {{{ startup
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <config>\n", argv[0]);
@@ -1030,3 +1050,4 @@ int main(int argc, char *argv[]) {
     IOLoop_block_on(server_p(address, port, backlog, basedir));
     return 0;
 }
+// }}}
