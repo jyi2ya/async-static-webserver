@@ -995,22 +995,34 @@ int main(int argc, char *argv[]) {
         *split = '\0';
         if (strcmp(left, "address") == 0) {
             strcpy(address, right);
-            config_nl += 1;
+            if (config_nl & 1) {
+                fprintf(stderr, "warning: duplicated configuration for `%s`\n", left);
+            }
+            config_nl |= 1;
         } else if (strcmp(left, "basedir") == 0) {
             strcpy(basedir, right);
-            config_nl += 1;
+            if (config_nl & 2) {
+                fprintf(stderr, "warning: duplicated configuration for `%s`\n", left);
+            }
+            config_nl |= 2;
         } else if (strcmp(left, "port") == 0) {
             port = atoi(right);
-            config_nl += 1;
+            if (config_nl & 4) {
+                fprintf(stderr, "warning: duplicated configuration for `%s`\n", left);
+            }
+            config_nl |= 4;
         } else if (strcmp(left, "backlog") == 0) {
             backlog = atoi(right);
-            config_nl += 1;
+            if (config_nl & 8) {
+                fprintf(stderr, "warning: duplicated configuration for `%s`\n", left);
+            }
+            config_nl |= 8;
         } else {
             fprintf(stderr, "warning: config `%s => %s` ignored\n", left, right);
         }
     }
 
-    if (config_nl != 4) {
+    if (config_nl != 0xf) {
         fprintf(stderr, "invalid configuration file\n");
         exit(1);
     }
