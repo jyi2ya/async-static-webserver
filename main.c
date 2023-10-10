@@ -265,7 +265,7 @@ IOLoop *IOLoop_new(void) {
     return self;
 }
 
-void *IOLoop_spawn_blocking(Promise *start) {
+void *IOLoop_block_on(Promise *start) {
     IOLoop *self = IOLoop_new();
     self->runnables[self->n_runnables++] = start;
 
@@ -1027,6 +1027,6 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    IOLoop_spawn_blocking(server_p(address, port, backlog, basedir));
+    IOLoop_block_on(server_p(address, port, backlog, basedir));
     return 0;
 }
