@@ -925,6 +925,8 @@ Promise *server_p_poll(Promise *self, Waker *waker) {
         assert(0);
     }
 
+    fprintf(stderr, "listening on %s:%d\n", ctx->address, ctx->port);
+
     for (;;) {
         ASYNC_AWAIT(int, ctx->incoming_fd, accept_p(ctx->listen_fd, (struct sockaddr *)&ctx->client_addr, &ctx->len));
 
@@ -965,6 +967,54 @@ Promise *server_p(char *address, int port, int backlog, const char *basedir) {
 }
 
 int main(int argc, char *argv[]) {
-    IOLoop_spawn_blocking(server_p("0.0.0.0", 2333, 15, "./"));
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <config>\n", argv[0]);
+        exit(1);
+    }
+
+    char address[4096];
+    char basedir[4096];
+    int port = 0;
+    int backlog = 0;
+
+    int config_nl = 0;
+
+    FILE *fp = fopen(argv[1], "r");
+    char line[4096];
+    while (!feof(fp)) {
+        fgets(line, sizeof(line), fp);
+        if (line[strlen(line) - 1] == '\n') {
+            line[strlen(line) - 1] = '\0';
+        }
+        char *split = strchr(line, '=');
+        if (split == NULL) {
+            continue;
+        }
+        char *left = line;
+        char *right = split + 1;
+        *split = '\0';
+        if (strcmp(left, "address") == 0) {
+            strcpy(address, right);
+            config_nl += 1;
+        } else if (strcmp(left, "basedir") == 0) {
+            strcpy(basedir, right);
+            config_nl += 1;
+        } else if (strcmp(left, "port") == 0) {
+            port = atoi(right);
+            config_nl += 1;
+        } else if (strcmp(left, "backlog") == 0) {
+            backlog = atoi(right);
+            config_nl += 1;
+        } else {
+            fprintf(stderr, "warning: config `%s => %s` ignored\n", left, right);
+        }
+    }
+
+    if (config_nl != 4) {
+        fprintf(stderr, "invalid configuration file\n");
+        exit(1);
+    }
+
+    IOLoop_spawn_blocking(server_p(address, port, backlog, basedir));
     return 0;
 }
