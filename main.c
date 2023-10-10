@@ -729,6 +729,7 @@ Promise *send_file_with_header_p_poll(Promise *self, Waker *waker) {
     sprintf(ctx->headers + strlen(ctx->headers), "%d\r\n\r\n", ctx->total_bytes);
 
     ASYNC_AWAIT(int, ctx->nbytes, write_all_p(ctx->fd, ctx->headers, 0));
+    free(ctx->headers);
 
     ctx->file_fd = open(ctx->path, O_RDWR | O_NONBLOCK);
     if (ctx->file_fd == -1) {
@@ -874,6 +875,7 @@ typedef struct {
     int incoming_fd;
     struct sockaddr_storage client_addr;
     socklen_t len;
+    int request_cnt;
 } ServerPContext;
 
 CONTEXT_ALLOCATION_FN(server_p, ServerPContext)
@@ -905,6 +907,8 @@ Promise *server_p_poll(Promise *self, Waker *waker) {
     for (;;) {
         ASYNC_AWAIT(int, ctx->incoming_fd, accept_p(ctx->listen_fd, (struct sockaddr *)&ctx->client_addr, &ctx->len));
 
+        ctx->request_cnt += 1;
+
         if (ctx->client_addr.ss_family != AF_INET) {
             fprintf(stderr, "currently we support ipv4 protocol only\n");
             fprintf(stderr, "required family is %u\n", ctx->client_addr.ss_family);
@@ -933,6 +937,7 @@ Promise *server_p(char *address, int port, int backlog, const char *basedir) {
     ctx->port = port;
     ctx->backlog = backlog;
     ctx->basedir = basedir;
+    ctx->request_cnt = 0;
 
     ctx->len = sizeof(ctx->client_addr);
     return self;
